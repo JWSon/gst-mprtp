@@ -78,8 +78,9 @@ _print_tree (bintree3_t * tree, bintree3node_t* node, gint32 level)
   //observer_notify(tree->on_print, string);
 
   memset(string, 0, 255);
-  sprintf(string, "%d->%p->data:%s  ref: %u ->left:%p ->right:%p\n",
-      level, node, string, node->ref, node->left, node->right);
+  //jang
+//  sprintf(string, "%d->%p->data:%s  ref: %u ->left:%p ->right:%p\n",
+//      level, node, string, node->ref, node->left, node->right);
   notifier_do(tree->on_print, string);
 
   _print_tree (tree, node->left, level + 1);

@@ -158,9 +158,10 @@ G_DEFINE_TYPE_WITH_CODE (GstMprtpsender, gst_mprtpsender, GST_TYPE_ELEMENT,
     GST_DEBUG_CATEGORY_INIT (gst_mprtpsender_debug_category, "mprtpsender", 0,
         "debug category for mprtpsender element"));
 
+/*
 #define GST_MPRTPSENDER_GET_PRIVATE(obj)  \
     (G_TYPE_INSTANCE_GET_PRIVATE ((obj), GST_TYPE_MPRTPSENDER, GstMprtpsenderPrivate))
-
+*/
 struct _GstMprtpsenderPrivate
 {
   gboolean have_same_caps;
@@ -230,7 +231,7 @@ gst_mprtpsender_mprtp_sink_query_handler (GstPad * pad, GstObject * parent, GstQ
 }
 
 
-G_DEFINE_TYPE_WITH_PRIVATE (GstMprtpsender, gst_mprtpsender, GST_TYPE_ELEMENT);
+//G_DEFINE_TYPE_WITH_PRIVATE (GstMprtpsender, gst_mprtpsender, GST_TYPE_ELEMENT);
 static void
 gst_mprtpsender_class_init (GstMprtpsenderClass * klass)
 {

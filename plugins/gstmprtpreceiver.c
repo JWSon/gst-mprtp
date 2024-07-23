@@ -1,0 +1,786 @@
+/* GStreamer
+ * Copyright (C) 2015 FIXME <fixme@example.com>
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Library General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Library General Public License for more details.
+ *
+ * You should have received a copy of the GNU Library General Public
+ * License along with this library; if not, write to the
+ * Free Software Foundation, Inc., 51 Franklin Street, Suite 500,
+ * Boston, MA 02110-1335, USA.
+ */
+/**
+ * SECTION:element-gstmprtpreceiver
+ *
+ * The mprtpreceiver element does FIXME stuff.
+ *
+ * <refsect2>
+ * <title>Example launch line</title>
+ * |[
+ * gst-launch -v fakesrc ! mprtpreceiver ! FIXME ! fakesink
+ * ]|
+ * FIXME Describe what the pipeline does.
+ * </refsect2>
+ */
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include <gst/gst.h>
+#include <stdio.h>
+#include <string.h>
+#include "gstmprtpreceiver.h"
+#include "gstmprtcpbuffer.h"
+
+
+GST_DEBUG_CATEGORY_STATIC (gst_mprtpreceiver_debug_category);
+#define GST_CAT_DEFAULT gst_mprtpreceiver_debug_category
+
+#define THIS_WRITELOCK(mprtcp_ptr) (g_rw_lock_writer_lock(&mprtcp_ptr->rwmutex))
+#define THIS_WRITEUNLOCK(mprtcp_ptr) (g_rw_lock_writer_unlock(&mprtcp_ptr->rwmutex))
+
+#define THIS_READLOCK(mprtcp_ptr) (g_rw_lock_reader_lock(&mprtcp_ptr->rwmutex))
+#define THIS_READUNLOCK(mprtcp_ptr) (g_rw_lock_reader_unlock(&mprtcp_ptr->rwmutex))
+
+#define PACKET_IS_RTP_OR_RTCP(b) (b > 0x7f && b < 0xc0)
+#define PACKET_IS_RTCP(b) (b > 192 && b < 223)
+#define PACKET_IS_DTLS(b) (b > 0x13 && b < 0x40)
+
+#define _now(this) gst_clock_get_time (this->sysclock)
+
+typedef struct
+{
+  GstPad *sinkpad;
+  GstPad *mprtcp_sinkpad;
+  guint8 id;
+} Subflow;
+
+static void gst_mprtpreceiver_set_property (GObject * object,
+    guint property_id, const GValue * value, GParamSpec * pspec);
+static void gst_mprtpreceiver_get_property (GObject * object,
+    guint property_id, GValue * value, GParamSpec * pspec);
+static void gst_mprtpreceiver_dispose (GObject * object);
+static void gst_mprtpreceiver_finalize (GObject * object);
+
+static GstPad *gst_mprtpreceiver_request_new_pad (GstElement * element,
+    GstPadTemplate * templ, const gchar * name, const GstCaps * caps);
+static void gst_mprtpreceiver_release_pad (GstElement * element, GstPad * pad);
+static GstStateChangeReturn
+gst_mprtpreceiver_change_state (GstElement * element,
+    GstStateChange transition);
+static gboolean gst_mprtpreceiver_query (GstElement * element,
+    GstQuery * query);
+static gboolean gst_mprtpreceiver_sink_query (GstPad * pad, GstObject * parent,
+    GstQuery * query);
+static gboolean gst_mprtpreceiver_src_query (GstPad * pad, GstObject * parent,
+    GstQuery * query);
+static gboolean gst_mprtpreceiver_sink_event (GstPad * pad, GstObject * parent,
+    GstEvent * event);
+static GstPadLinkReturn gst_mprtpreceiver_sink_link (GstPad * pad,
+    GstObject * parent, GstPad * peer);
+static void gst_mprtpreceiver_sink_unlink (GstPad * pad, GstObject * parent);
+static GstFlowReturn gst_mprtpreceiver_sink_chain (GstPad * pad,
+    GstObject * parent, GstBuffer * buffer);
+
+GstFlowReturn _send_mprtcp_buffer (GstMprtpreceiver * this, GstBuffer * buf);
+enum
+{
+  PROP_0,
+  PROP_MPRTP_EXT_HEADER_ID,
+  PROP_REPORT_ONLY,
+  PROP_FEC_PAYLOAD_TYPE,
+};
+
+
+/* pad templates */
+
+static GstStaticPadTemplate gst_mprtpreceiver_sink_template =
+GST_STATIC_PAD_TEMPLATE ("sink_%u",
+    GST_PAD_SINK,
+    GST_PAD_REQUEST,
+    GST_STATIC_CAPS ("ANY")
+    );
+
+static GstStaticPadTemplate gst_mprtpreceiver_mprtcp_sink_template =
+GST_STATIC_PAD_TEMPLATE ("mprtcp_sink_%u",
+    GST_PAD_SINK,
+    GST_PAD_REQUEST,
+    GST_STATIC_CAPS ("ANY")
+    );
+
+static GstStaticPadTemplate gst_mprtpreceiver_mprtcp_rr_src_template =
+GST_STATIC_PAD_TEMPLATE ("mprtcp_rr_src",
+    GST_PAD_SRC,
+    GST_PAD_ALWAYS,
+    GST_STATIC_CAPS ("application/x-rtcp")
+    );
+
+
+static GstStaticPadTemplate gst_mprtpreceiver_mprtcp_sr_src_template =
+GST_STATIC_PAD_TEMPLATE ("mprtcp_sr_src",
+    GST_PAD_SRC,
+    GST_PAD_ALWAYS,
+    GST_STATIC_CAPS ("application/x-rtcp")
+    );
+
+
+static GstStaticPadTemplate gst_mprtpreceiver_mprtp_src_template =
+GST_STATIC_PAD_TEMPLATE ("mprtp_src",
+    GST_PAD_SRC,
+    GST_PAD_ALWAYS,
+    GST_STATIC_CAPS ("ANY")
+    );
+
+
+/* class initialization */
+
+G_DEFINE_TYPE_WITH_CODE (GstMprtpreceiver, gst_mprtpreceiver, GST_TYPE_ELEMENT,
+    GST_DEBUG_CATEGORY_INIT (gst_mprtpreceiver_debug_category, "mprtpreceiver",
+        0, "debug category for mprtpreceiver element"));
+
+static void
+gst_mprtpreceiver_class_init (GstMprtpreceiverClass * klass)
+{
+  GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
+  GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
+
+  /* Setting up pads and setting metadata should be moved to
+     base_class_init if you intend to subclass this class. */
+  gst_element_class_add_pad_template (element_class,
+      gst_static_pad_template_get (&gst_mprtpreceiver_sink_template));
+  gst_element_class_add_pad_template (element_class,
+      gst_static_pad_template_get (&gst_mprtpreceiver_mprtcp_sink_template));
+  gst_element_class_add_pad_template (element_class,
+      gst_static_pad_template_get (&gst_mprtpreceiver_mprtcp_rr_src_template));
+  gst_element_class_add_pad_template (element_class,
+      gst_static_pad_template_get (&gst_mprtpreceiver_mprtcp_sr_src_template));
+  gst_element_class_add_pad_template (element_class,
+      gst_static_pad_template_get (&gst_mprtpreceiver_mprtp_src_template));
+
+  gst_element_class_set_static_metadata (GST_ELEMENT_CLASS (klass),
+      "MpRTP Receiver plugin", "Generic", "FIXME Description",
+      "Balázs Kreith <balazskreith@gmail.com>");
+
+  gobject_class->set_property = gst_mprtpreceiver_set_property;
+  gobject_class->get_property = gst_mprtpreceiver_get_property;
+  gobject_class->dispose = gst_mprtpreceiver_dispose;
+  gobject_class->finalize = gst_mprtpreceiver_finalize;
+
+  g_object_class_install_property (gobject_class, PROP_MPRTP_EXT_HEADER_ID,
+      g_param_spec_uint ("mprtp-ext-header-id",
+          "Set or get the id for the RTP extension",
+          "Sets or gets the id for the extension header the MpRTP based on", 0,
+          15, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_REPORT_ONLY,
+      g_param_spec_boolean ("report-only",
+          "Indicate weather the receiver only receive reports on its subflows",
+          "Indicate weather the receiver only receive reports on its subflows",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_FEC_PAYLOAD_TYPE,
+      g_param_spec_uint ("fec-payload-type",
+          "Set or get the payload type of fec packets",
+          "Set or get the payload type of fec packets. The default is 126",
+          0, 127, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  element_class->request_new_pad =
+      GST_DEBUG_FUNCPTR (gst_mprtpreceiver_request_new_pad);
+  element_class->release_pad =
+      GST_DEBUG_FUNCPTR (gst_mprtpreceiver_release_pad);
+  element_class->change_state =
+      GST_DEBUG_FUNCPTR (gst_mprtpreceiver_change_state);
+  element_class->query = GST_DEBUG_FUNCPTR (gst_mprtpreceiver_query);
+
+
+}
+
+static void
+gst_mprtpreceiver_init (GstMprtpreceiver * mprtpreceiver)
+{
+  mprtpreceiver->mprtcp_sr_srcpad =
+      gst_pad_new_from_static_template
+      (&gst_mprtpreceiver_mprtcp_sr_src_template, "mprtcp_sr_src");
+  gst_element_add_pad (GST_ELEMENT (mprtpreceiver),
+      mprtpreceiver->mprtcp_sr_srcpad);
+
+  mprtpreceiver->mprtcp_rr_srcpad =
+      gst_pad_new_from_static_template
+      (&gst_mprtpreceiver_mprtcp_rr_src_template, "mprtcp_rr_src");
+  gst_element_add_pad (GST_ELEMENT (mprtpreceiver),
+      mprtpreceiver->mprtcp_rr_srcpad);
+
+  mprtpreceiver->mprtp_srcpad =
+      gst_pad_new_from_static_template
+      (&gst_mprtpreceiver_mprtp_src_template, "mprtp_src");
+
+  gst_element_add_pad (GST_ELEMENT (mprtpreceiver),
+      mprtpreceiver->mprtp_srcpad);
+
+  gst_pad_set_query_function(mprtpreceiver->mprtp_srcpad,
+      GST_DEBUG_FUNCPTR(gst_mprtpreceiver_src_query));
+
+  g_rw_lock_init (&mprtpreceiver->rwmutex);
+
+  mprtpreceiver->only_report_receiving = FALSE;
+  mprtpreceiver->mprtp_ext_header_id = MPRTP_DEFAULT_EXTENSION_HEADER_ID;
+  mprtpreceiver->fec_payload_type = FEC_PAYLOAD_DEFAULT_ID;
+  mprtpreceiver->sysclock = gst_system_clock_obtain();
+
+}
+
+void
+gst_mprtpreceiver_set_property (GObject * object, guint property_id,
+    const GValue * value, GParamSpec * pspec)
+{
+  GstMprtpreceiver *this = GST_MPRTPRECEIVER (object);
+  GST_DEBUG_OBJECT (this, "set_property");
+
+  THIS_WRITELOCK (this);
+  switch (property_id) {
+    case PROP_MPRTP_EXT_HEADER_ID:
+      this->mprtp_ext_header_id = (guint8) g_value_get_uint (value);
+      break;
+    case PROP_FEC_PAYLOAD_TYPE:
+      this->fec_payload_type = (guint8) g_value_get_uint (value);
+      break;
+    case PROP_REPORT_ONLY:
+      this->only_report_receiving = g_value_get_boolean (value);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+      break;
+  }
+  THIS_WRITEUNLOCK (this);
+}
+
+void
+gst_mprtpreceiver_get_property (GObject * object, guint property_id,
+    GValue * value, GParamSpec * pspec)
+{
+  GstMprtpreceiver *this = GST_MPRTPRECEIVER (object);
+
+  GST_DEBUG_OBJECT (this, "get_property");
+
+  THIS_READLOCK (this);
+  switch (property_id) {
+    case PROP_MPRTP_EXT_HEADER_ID:
+      g_value_set_uint (value, (guint) this->mprtp_ext_header_id);
+      break;
+    case PROP_FEC_PAYLOAD_TYPE:
+       g_value_set_uint (value, (guint) this->fec_payload_type);
+       break;
+    case PROP_REPORT_ONLY:
+      g_value_set_boolean (value, this->only_report_receiving);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+      break;
+  }
+  THIS_READUNLOCK (this);
+}
+
+void
+gst_mprtpreceiver_dispose (GObject * object)
+{
+  GstMprtpreceiver *mprtpreceiver = GST_MPRTPRECEIVER (object);
+
+  GST_DEBUG_OBJECT (mprtpreceiver, "dispose");
+
+  /* clean up as possible.  may be called multiple times */
+
+  G_OBJECT_CLASS (gst_mprtpreceiver_parent_class)->dispose (object);
+}
+
+void
+gst_mprtpreceiver_finalize (GObject * object)
+{
+  GstMprtpreceiver *mprtpreceiver = GST_MPRTPRECEIVER (object);
+
+  GST_DEBUG_OBJECT (mprtpreceiver, "finalize");
+
+  /* clean up object here */
+  gst_object_unref(mprtpreceiver->sysclock);
+  G_OBJECT_CLASS (gst_mprtpreceiver_parent_class)->finalize (object);
+}
+
+
+
+static GstPad *
+gst_mprtpreceiver_request_new_pad (GstElement * element, GstPadTemplate * templ,
+    const gchar * name, const GstCaps * caps)
+{
+
+  GstPad *sinkpad;
+  GstMprtpreceiver *this;
+  guint8 subflow_id;
+  Subflow *subflow = NULL;
+  gboolean mprtcp = FALSE;
+  GList *it;
+
+  this = GST_MPRTPRECEIVER (element);
+  GST_DEBUG_OBJECT (this, "requesting pad");
+
+  if(sscanf (name, "sink_%hhu", &subflow_id)){
+    mprtcp = FALSE;
+  }else if(sscanf (name, "mprtcp_sink_%hhu", &subflow_id)){
+    mprtcp = TRUE;
+  }
+
+  THIS_WRITELOCK (this);
+
+  sinkpad = gst_pad_new_from_template (templ, name);
+  gst_pad_set_query_function (sinkpad,
+      GST_DEBUG_FUNCPTR (gst_mprtpreceiver_sink_query));
+  gst_pad_set_event_function (sinkpad,
+      GST_DEBUG_FUNCPTR (gst_mprtpreceiver_sink_event));
+  gst_pad_set_link_function (sinkpad,
+      GST_DEBUG_FUNCPTR (gst_mprtpreceiver_sink_link));
+  gst_pad_set_unlink_function (sinkpad,
+      GST_DEBUG_FUNCPTR (gst_mprtpreceiver_sink_unlink));
+  gst_pad_set_chain_function (sinkpad,
+      GST_DEBUG_FUNCPTR (gst_mprtpreceiver_sink_chain));
+
+  for(it = this->subflows; it; it = it->next){
+    subflow = it->data;
+    if(subflow->id == subflow_id) break;
+    subflow = NULL;
+  }
+
+  if(!subflow){
+      subflow = (Subflow *) g_malloc0 (sizeof (Subflow));
+      subflow->id = subflow_id;
+      this->subflows = g_list_prepend (this->subflows, subflow);
+  }
+
+  if(mprtcp){
+    subflow->mprtcp_sinkpad = sinkpad;
+  }else{
+    subflow->sinkpad = sinkpad;
+  }
+
+  THIS_WRITEUNLOCK (this);
+
+  gst_pad_set_active (sinkpad, TRUE);
+
+  gst_element_add_pad (GST_ELEMENT (this), sinkpad);
+
+  return sinkpad;
+}
+
+
+static gboolean
+gst_mprtpreceiver_sink_query (GstPad * sinkpad, GstObject * parent,
+    GstQuery * query)
+{
+  GstMprtpreceiver *this = GST_MPRTPRECEIVER (parent);
+  gboolean result;
+  GST_DEBUG_OBJECT (this, "query");
+//  g_print ("QUERY to the sink: %s\n", GST_QUERY_TYPE_NAME (query));
+  switch (GST_QUERY_TYPE (query)) {
+    default:
+      result = gst_pad_peer_query (this->mprtp_srcpad, query);
+      break;
+  }
+
+  return result;
+}
+
+
+gboolean
+gst_mprtpreceiver_src_query (GstPad * srcpad, GstObject * parent,
+    GstQuery * query)
+{
+  GstMprtpreceiver *this = GST_MPRTPRECEIVER (parent);
+  gboolean result;
+  GST_DEBUG_OBJECT (this, "query");
+//  g_print ("QUERY to the sink: %s\n", GST_QUERY_TYPE_NAME (query));
+  switch (GST_QUERY_TYPE (query)) {
+    case GST_QUERY_LATENCY:
+    {
+      gboolean live;
+      GstClockTime min, max;
+      GstPad *peer;
+      if(!g_list_length(this->subflows)) goto default_query;
+      peer = gst_pad_get_peer (((Subflow*)(this->subflows->data))->sinkpad);
+      if ((result = gst_pad_query (peer, query))) {
+          gst_query_parse_latency (query, &live, &min, &max);
+          min= 0;
+          max = -1;
+          gst_query_set_latency (query, live, min, max);
+      }
+      gst_object_unref (peer);
+    }
+    break;
+    default:
+    default_query:
+      result = gst_pad_query_default(srcpad, parent, query);
+      break;
+  }
+
+  return result;
+}
+
+
+static gboolean
+gst_mprtpreceiver_sink_event (GstPad * pad, GstObject * parent,
+    GstEvent * event)
+{
+  GstMprtpreceiver *this = GST_MPRTPRECEIVER (parent);
+  gboolean result = FALSE;
+  GstPad *peer;
+//  g_print ("EVENT to the sink: %s\n", GST_EVENT_TYPE_NAME (event));
+  GST_DEBUG_OBJECT (this, "sink event");
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_SEGMENT:
+    case GST_EVENT_SEGMENT_DONE:
+    case GST_EVENT_EOS:
+    case GST_EVENT_FLUSH_START:
+    case GST_EVENT_FLUSH_STOP:
+    case GST_EVENT_LATENCY:
+    case GST_EVENT_STREAM_START:
+      if (this->only_report_receiving) {
+        result = TRUE;
+        goto done;
+      }
+    default:
+      if (gst_pad_is_linked (this->mprtp_srcpad)) {
+        peer = gst_pad_get_peer (this->mprtp_srcpad);
+        result = gst_pad_send_event (peer, event);
+        gst_object_unref (peer);
+      }
+      //g_print ("EVENT to the sink: %s", GST_EVENT_TYPE_NAME (event));
+      result = gst_pad_event_default (pad, parent, event);
+      break;
+  }
+done:
+  return result;
+}
+
+static void
+gst_mprtpreceiver_release_pad (GstElement * element, GstPad * pad)
+{
+
+}
+
+static GstStateChangeReturn
+gst_mprtpreceiver_change_state (GstElement * element, GstStateChange transition)
+{
+  GstStateChangeReturn ret;
+  g_return_val_if_fail (GST_IS_MPRTPRECEIVER (element),
+      GST_STATE_CHANGE_FAILURE);
+
+  switch (transition) {
+    case GST_STATE_CHANGE_NULL_TO_READY:
+      break;
+    case GST_STATE_CHANGE_READY_TO_PAUSED:
+      break;
+    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+      break;
+    default:
+      break;
+  }
+
+  ret =
+      GST_ELEMENT_CLASS (gst_mprtpreceiver_parent_class)->change_state (element,
+      transition);
+
+  switch (transition) {
+    case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
+      break;
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+      break;
+    case GST_STATE_CHANGE_READY_TO_NULL:
+      break;
+    default:
+      break;
+  }
+
+  return ret;
+}
+
+
+
+
+static gboolean
+gst_mprtpreceiver_query (GstElement * element, GstQuery * query)
+{
+  GstMprtpreceiver *mprtpreceiver = GST_MPRTPRECEIVER (element);
+  gboolean ret;
+
+  GST_DEBUG_OBJECT (mprtpreceiver, "query");
+//  g_print ("QUERY to the element: %s\n", GST_QUERY_TYPE_NAME (query));
+  switch (GST_QUERY_TYPE (query)) {
+    default:
+      ret =
+          GST_ELEMENT_CLASS (gst_mprtpreceiver_parent_class)->query (element,
+          query);
+      break;
+  }
+
+  return ret;
+}
+
+
+static GstPadLinkReturn
+gst_mprtpreceiver_sink_link (GstPad * pad, GstObject * parent, GstPad * peer)
+{
+  GstMprtpreceiver *mprtpreceiver;
+  mprtpreceiver = GST_MPRTPRECEIVER (parent);
+  GST_DEBUG_OBJECT (mprtpreceiver, "link");
+
+  return GST_PAD_LINK_OK;
+}
+
+static void
+gst_mprtpreceiver_sink_unlink (GstPad * pad, GstObject * parent)
+{
+  GstMprtpreceiver *mprtpreceiver;
+  mprtpreceiver = GST_MPRTPRECEIVER (parent);
+  GST_DEBUG_OBJECT (mprtpreceiver, "unlink");
+
+}
+
+
+
+typedef enum
+{
+  PACKET_IS_MPRTP,
+  PACKET_IS_MPRTCP,
+  PACKET_IS_NOT_MP,
+  PACKET_IS_MPRTP_MONITORING,
+} PacketTypes;
+
+static PacketTypes
+_get_packet_mptype (GstMprtpreceiver * this,
+    GstBuffer * buf, GstMapInfo * info, guint8 * subflow_id)
+{
+
+  guint8 first_byte, second_byte;
+  PacketTypes result = PACKET_IS_NOT_MP;
+  GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
+  MPRTPSubflowHeaderExtension *subflow_infos = NULL;
+  guint size;
+  gpointer pointer;
+
+  if (gst_buffer_extract (buf, 0, &first_byte, 1) != 1 ||
+      gst_buffer_extract (buf, 1, &second_byte, 1) != 1) {
+    GST_WARNING_OBJECT (this, "could not extract first byte from buffer");
+    goto done;
+  }
+
+  if (PACKET_IS_DTLS (first_byte)) {
+    goto done;
+  }
+
+  if (PACKET_IS_RTP_OR_RTCP (first_byte)) {
+    if (PACKET_IS_RTCP (second_byte)) {
+      if (second_byte != MPRTCP_PACKET_TYPE_IDENTIFIER) {
+        goto done;
+      }
+      if (subflow_id) {
+        *subflow_id = (guint8)
+            g_ntohs (*((guint16 *) (info->data + 8 /*RTCP Header */  +
+                    6 /*first block info until subflow id */ )));
+      }
+      result = PACKET_IS_MPRTCP;
+      goto done;
+    }
+    if (G_UNLIKELY (!gst_rtp_buffer_map (buf, GST_MAP_READ, &rtp))) {
+      GST_WARNING_OBJECT (this, "The RTP packet is not readable");
+      goto done;
+    }
+
+    if (!gst_rtp_buffer_get_extension (&rtp)) {
+      gst_rtp_buffer_unmap (&rtp);
+      goto done;
+    }
+    if (!gst_rtp_buffer_get_extension_onebyte_header (&rtp,
+            this->mprtp_ext_header_id, 0, &pointer, &size)) {
+      gst_rtp_buffer_unmap (&rtp);
+      goto done;
+    }
+
+    if (subflow_id) {
+      subflow_infos = (MPRTPSubflowHeaderExtension *) pointer;
+      *subflow_id = subflow_infos->id;
+    }
+    if(gst_rtp_buffer_get_payload_type(&rtp) == this->fec_payload_type){
+      result = PACKET_IS_MPRTP_MONITORING;
+    }else{
+      result = PACKET_IS_MPRTP;
+    }
+//    g_print("%d-%u|", *subflow_id, gst_rtp_buffer_get_timestamp(&rtp));
+    gst_rtp_buffer_unmap (&rtp);
+    goto done;
+  }
+
+done:
+  return result;
+}
+
+
+static GstFlowReturn
+gst_mprtpreceiver_sink_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
+{
+  GstMprtpreceiver *this;
+  GstFlowReturn result;
+  GstMapInfo map;
+  PacketTypes packet_type;
+  guint8 subflow_id = 0;
+
+  this = GST_MPRTPRECEIVER (parent);
+  GST_DEBUG_OBJECT (this, "RTP/MPRTP/OTHER sink");
+  if (!gst_buffer_map (buf, &map, GST_MAP_READ)) {
+    GST_ERROR_OBJECT (this, "Buffer is not readable");
+    result = GST_FLOW_CUSTOM_ERROR;
+    goto exit;
+  }
+
+  THIS_READLOCK (this);
+//  PROFILING("gst_mprtpreceiver_sink_chain",
+  packet_type = _get_packet_mptype (this, buf, &map, &subflow_id);
+//  );
+  if (packet_type == PACKET_IS_MPRTCP) {
+    result = _send_mprtcp_buffer (this, buf);
+  } else if(packet_type == PACKET_IS_MPRTP_MONITORING){
+    gst_buffer_unmap (buf, &map);
+    result = gst_pad_push (this->mprtcp_sr_srcpad, buf);
+  }else{
+    gst_buffer_unmap (buf, &map);
+    result = gst_pad_push (this->mprtp_srcpad, buf);
+  }
+
+  THIS_READUNLOCK (this);
+
+exit:
+  return result;
+}
+
+
+
+
+GstFlowReturn
+_send_mprtcp_buffer (GstMprtpreceiver * this, GstBuffer * buf)
+{
+  GstFlowReturn result = GST_FLOW_OK;
+  GstPad *outpad;
+  GstRTCPBuffer rtcp = { NULL, };
+  GstRTCPHeader *header;
+  GstMPRTCPSubflowReport *report;
+  GstMPRTCPSubflowBlock *block;
+  guint8 block_length;
+  gpointer databed, actual;
+  guint16 processed_length;
+  guint16 actual_length;
+  guint8 pt;
+
+  if (G_UNLIKELY (!gst_rtcp_buffer_map (buf, GST_MAP_READ, &rtcp))) {
+    GST_WARNING_OBJECT (this, "The RTCP packet is not readable");
+    return result;
+  }
+
+  report = (GstMPRTCPSubflowReport *) gst_rtcp_get_first_header (&rtcp);
+//  gst_print_mprtcp(report);
+  block = gst_mprtcp_get_first_block (report);
+  outpad = this->mprtcp_rr_srcpad;
+  gst_mprtcp_block_getdown(&block->info, NULL, &block_length, NULL);
+  actual = databed = header = &block->block_header;
+
+  for(processed_length = 0; processed_length < block_length; )
+  {
+      gst_rtcp_header_getdown (header, NULL, NULL, NULL, &pt, &actual_length, NULL);
+      if(pt == GST_RTCP_TYPE_SR){
+        outpad = this->mprtcp_sr_srcpad;
+      }
+      processed_length +=actual_length + 1;
+      header = actual = processed_length * 4 + (gchar*)databed;
+  }
+  result = gst_pad_push (outpad, buf);
+  return result;
+}
+
+
+//
+//GstFlowReturn
+//_send_mprtcp_buffer (GstMprtpreceiver * this, GstBuffer * buf)
+//{
+//  GstFlowReturn result = GST_FLOW_OK;
+//  GstPad *outpad;
+//  GstRTCPBuffer rtcp = { NULL, };
+//  GstRTCPHeader *block_header;
+//  GstMPRTCPSubflowReport *report;
+//  GstMPRTCPSubflowBlock *block;
+//  GstMPRTCPSubflowInfo *info;
+//  guint8 info_type;
+//  guint8 block_length;
+//  guint8 block_riport_type;
+//  GstBuffer *buffer;
+//  gpointer data;
+//  gsize buf_length;
+//  guint8 src = 0;
+//
+//  if (G_UNLIKELY (!gst_rtcp_buffer_map (buf, GST_MAP_READ, &rtcp))) {
+//    GST_WARNING_OBJECT (this, "The RTCP packet is not readable");
+//    return result;
+//  }
+//
+//  report = (GstMPRTCPSubflowReport *) gst_rtcp_get_first_header (&rtcp);
+////  gst_print_rtcp(&report->header);
+//  for (block = gst_mprtcp_get_first_block (report);
+//      block != NULL; block = gst_mprtcp_get_next_block (report, block, &src)) {
+//    info = &block->info;
+//    gst_mprtcp_block_getdown (info, &info_type, &block_length, NULL);
+//    if (info_type != 0) {
+//      continue;
+//    }
+//    block_header = &block->block_header;
+//    gst_rtcp_header_getdown (block_header, NULL, NULL, NULL,
+//        &block_riport_type, NULL, NULL);
+//
+//    buf_length = (block_length + 1) << 2;
+//    data = g_malloc0 (buf_length);
+//    memcpy (data, (gpointer) block, buf_length);
+//    buffer = gst_buffer_new_wrapped (data, buf_length);
+//    outpad = (block_riport_type == GST_RTCP_TYPE_SR) ? this->mprtcp_sr_srcpad
+//        : this->mprtcp_rr_srcpad;
+////    {
+////      guint16 subflow_id;
+////      gst_mprtcp_block_getdown (info, NULL, NULL, &subflow_id);
+////      if(block_riport_type == GST_RTCP_TYPE_SR){
+////          guint64 ntptime;
+////          GstRTCPSR *sr;
+////          sr = &block->sender_riport;
+////          gst_rtcp_srb_getdown(&sr->sender_block, &ntptime, NULL, NULL, NULL);
+////          g_print("Created NTP time for subflow %d is %lu, but it "
+////              "received at: %lu (%lu)\n",
+////              subflow_id, ntptime, NTP_NOW>>32,
+////              get_epoch_time_from_ntp_in_ns(NTP_NOW - ntptime));
+////      }
+////    }
+////    g_print("ARRIVED REPORT: %d\n", block_riport_type);
+//    if ((result = gst_pad_push (outpad, buffer)) != GST_FLOW_OK) {
+//      goto done;
+//    }
+//
+//  }
+////  g_print("-------------------------\n");
+//done:
+//  return result;
+//}
+
+
+#undef THIS_WRITELOCK
+#undef THIS_WRITEUNLOCK
+#undef THIS_READLOCK
+#undef THIS_READUNLOCK
+#undef PACKET_IS_RTP_OR_RTCP
+#undef PACKET_IS_DTLS

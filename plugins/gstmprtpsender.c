@@ -158,10 +158,10 @@ G_DEFINE_TYPE_WITH_CODE (GstMprtpsender, gst_mprtpsender, GST_TYPE_ELEMENT,
     GST_DEBUG_CATEGORY_INIT (gst_mprtpsender_debug_category, "mprtpsender", 0,
         "debug category for mprtpsender element"));
 
-/*
+
 #define GST_MPRTPSENDER_GET_PRIVATE(obj)  \
     (G_TYPE_INSTANCE_GET_PRIVATE ((obj), GST_TYPE_MPRTPSENDER, GstMprtpsenderPrivate))
-*/
+
 struct _GstMprtpsenderPrivate
 {
   gboolean have_same_caps;
